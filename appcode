@@ -1,0 +1,192 @@
+package com.example;
+
+import com.cloudera.hiveserver2.hivecommon.core.IHadoopStatement;
+import com.cloudera.hiveserver2.support.exceptions.ErrorException;
+
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Scanner;
+import java.util.logging.ConsoleHandler;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+public class HiveJdbcClient {
+
+    // Logger for handling exceptions.
+    private static final Logger LOGGER = Logger.getLogger(HiveJdbcClient.class.getName());
+
+    static {
+        // Configure logger for verbose output
+        Logger rootLogger = Logger.getLogger("");
+        Handler[] handlers = rootLogger.getHandlers();
+        if (handlers.length > 0 && handlers[0] instanceof ConsoleHandler) {
+            rootLogger.removeHandler(handlers[0]);
+        }
+        Handler consoleHandler = new ConsoleHandler();
+        consoleHandler.setLevel(Level.ALL);
+        LOGGER.addHandler(consoleHandler);
+        LOGGER.setLevel(Level.ALL);
+        LOGGER.setUseParentHandlers(false);
+    }
+
+    // JDBC Driver and Connection details
+    private static final String HIVE_DRIVER_CLASS = "com.cloudera.hive.jdbc.HS2Driver";
+    private static final String BASE_CONNECTION_URL = "jdbc:hive2://zk=ccycloud-2.nightly7x-us-hr.root.comops.site:2181/hiveserver2";
+
+    public static void main(String[] args) {
+        System.out.println("Starting Interactive Hive JDBC Client...");
+        String fullConnectionUrl = BASE_CONNECTION_URL + ";LogLevel=6;LogPath=./logs";
+        System.out.println("Connecting to: " + fullConnectionUrl);
+
+        try {
+            Class.forName(HIVE_DRIVER_CLASS);
+        } catch (ClassNotFoundException e) {
+            LOGGER.log(Level.SEVERE, "Fatal Error: Cloudera Hive JDBC driver not found.", e);
+            return;
+        }
+
+        // Use try-with-resources for the Scanner and Connection to ensure they are closed
+        try (Scanner scanner = new Scanner(System.in);
+             Connection connection = DriverManager.getConnection(fullConnectionUrl)) {
+
+            System.out.println("Successfully connected to Hive. Type 'quit' or 'exit' to terminate.");
+
+            while (true) {
+                System.out.print("hive> ");
+                String sqlQuery = scanner.nextLine();
+
+                if (sqlQuery == null || sqlQuery.trim().isEmpty()) {
+                    continue;
+                }
+                if (sqlQuery.trim().equalsIgnoreCase("quit") || sqlQuery.trim().equalsIgnoreCase("exit")) {
+                    System.out.println("Exiting client.");
+                    break;
+                }
+
+                // Use try-with-resources for the Statement to ensure it's closed after each query
+                try (Statement statement = connection.createStatement()) {
+                    System.out.println("Execution logs will be overwritten in ./logs/execution.log");
+                    Thread logFetcherThread = new Thread(new LogFetcher(statement));
+                    logFetcherThread.setDaemon(true);
+                    logFetcherThread.start();
+
+                    boolean hasResultSet = statement.execute(sqlQuery);
+
+                    if (hasResultSet) {
+                        processResultSet(statement.getResultSet());
+                    } else {
+                        System.out.println("OK");
+                        System.out.println("Rows affected: " + statement.getUpdateCount());
+                    }
+
+                    // Wait for the log fetcher to finish
+                    logFetcherThread.join(2000);
+
+                } catch (SQLException e) {
+                    System.err.println("SQL Execution Error: " + e.getMessage());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        } catch (SQLException e) {
+            LOGGER.log(Level.SEVERE, "Failed to connect to Hive.", e);
+        }
+    }
+    
+    /**
+     * Processes and prints a ResultSet with dynamic columns to the console.
+     */
+    private static void processResultSet(ResultSet rs) throws SQLException {
+        ResultSetMetaData metaData = rs.getMetaData();
+        int columnCount = metaData.getColumnCount();
+
+        // Print header
+        for (int i = 1; i <= columnCount; i++) {
+            System.out.print(metaData.getColumnName(i) + "\t");
+        }
+        System.out.println();
+        System.out.println("----------------------------------------");
+
+        // Print rows
+        int rowCount = 0;
+        while (rs.next()) {
+            for (int i = 1; i <= columnCount; i++) {
+                System.out.print(rs.getString(i) + "\t");
+            }
+            System.out.println();
+            rowCount++;
+        }
+        System.out.println("----------------------------------------");
+        System.out.println(rowCount + " row(s) returned.");
+    }
+
+    /**
+     * A Runnable class that fetches Hive execution logs and writes them to a file.
+     */
+    static class LogFetcher implements Runnable {
+        private final Statement stmt;
+        private static final String LOG_FILE_PATH = "./logs/execution.log";
+
+        public LogFetcher(Statement statement) {
+            this.stmt = statement;
+        }
+
+        @Override
+        public void run() {
+            // This FileWriter will overwrite the file on each run
+            try (PrintWriter writer = new PrintWriter(new FileWriter(LOG_FILE_PATH, false))) {
+                IHadoopStatement hadoopStatement = stmt.unwrap(IHadoopStatement.class);
+                String yarnAppId = null;
+
+                // Poll to find the App ID and write all logs
+                while (!stmt.isClosed()) {
+                    boolean hadLogs = hadoopStatement.hasMoreLogs();
+                    if (hadLogs) {
+                        try {
+                            List<String> logs = hadoopStatement.getQueryLog(true, 100);
+                            for (String logLine : logs) {
+                                writer.println(logLine);
+                                // Find the App ID if we haven't already
+                                if (yarnAppId == null && logLine.contains("application_")) {
+                                    String[] words = logLine.split("[\\s,()'\"]+");
+                                    for (String word : words) {
+                                        if (word.startsWith("application_")) {
+                                            yarnAppId = word;
+                                            System.out.println("YARN Application ID: " + yarnAppId);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (ErrorException e) {
+                            writer.println("ERROR fetching query logs: " + e.getMessage());
+                        }
+                    }
+                    // If the statement is done and there are no more logs, exit the loop
+                    if (stmt.isClosed() && !hadLogs) {
+                        break;
+                    }
+                    Thread.sleep(500);
+                }
+            } catch (IOException e) {
+                LOGGER.log(Level.SEVERE, "Could not write to execution log file.", e);
+            } catch (SQLException e) {
+                if (!e.getMessage().contains("Statement is closed")) {
+                   LOGGER.log(Level.WARNING, "SQL error in log fetcher.", e);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+}
